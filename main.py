@@ -262,6 +262,10 @@ class TwseClient:
                         "curl",
                         "-sS",
                         "--compressed",
+                        "--connect-timeout",
+                        "10",
+                        "--max-time",
+                        "30",
                         "-w",
                         "\n__STATUS__:%{http_code}",
                         request_url,
@@ -892,6 +896,7 @@ def find_latest_trading_day(client: TwseClient, anchor: date | None = None) -> d
 def resolve_end_date(client: TwseClient, end: date | None) -> date:
     if end:
         return end
+    logger.info("未指定 --end，正在偵測最近交易日...")
     latest = find_latest_trading_day(client)
     logger.info("未指定 --end，使用最近交易日 {}", latest.isoformat())
     return latest
@@ -1431,9 +1436,9 @@ def run_market_adj_backfill(client: TwseClient, out_dir: Path) -> None:
 
 
 def run_market_range_all(client: TwseClient, args: argparse.Namespace) -> None:
+    args.out_dir.mkdir(parents=True, exist_ok=True)
     end = resolve_end_date(client, args.end)
     ensure_range(args.start, end)
-    args.out_dir.mkdir(parents=True, exist_ok=True)
 
     total_days = 0
     written_days = 0
