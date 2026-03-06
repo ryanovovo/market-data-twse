@@ -36,6 +36,7 @@ uv run main.py <command> ... --delay 1.0
 - 內建隨機抖動與重試退避（遇到 429/5xx 會自動慢下來）
 - 日資料查詢會自動跳過週末，減少無效請求
 - 長時間任務會顯示 `tqdm` 進度條
+- 若 `openapi.twse.com.tw` 無法連線，上市公司清單會自動 fallback 到專案內建 `listed_companies_snapshot.csv`
 
 ### 股價（日線）
 

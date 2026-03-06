@@ -21,6 +21,7 @@ TWSE_BASE = "https://www.twse.com.tw"
 TWSE_OPENAPI_BASE = "https://openapi.twse.com.tw/v1"
 TWSE_RWD_ZH_BASE = "https://www.twse.com.tw/rwd/zh"
 MARKET_DAY_FILE_RE = re.compile(r"market_day_all_(\d{4}-\d{2}-\d{2})\.(csv|parquet)$")
+LISTED_SNAPSHOT_PATH = Path(__file__).resolve().with_name("listed_companies_snapshot.csv")
 INSTITUTION_FIELDS = (
     "inst_foreign_buy",
     "inst_foreign_sell",
@@ -693,7 +694,11 @@ class TwseClient:
         return rows
 
     def fetch_sbl_available_all(self) -> dict[str, str]:
-        rows = self._get_json(f"{TWSE_OPENAPI_BASE}/SBL/TWT96U")
+        try:
+            rows = self._get_json(f"{TWSE_OPENAPI_BASE}/SBL/TWT96U")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("無法取得 TWT96U（借券可用量），改以空值繼續：{}", exc)
+            return {}
         out: dict[str, str] = {}
         for row in rows:
             code = cleanup_cell(row.get("TWSECode", ""))
@@ -821,7 +826,11 @@ class TwseClient:
         return result
 
     def fetch_sbl_available(self, stock_no: str) -> list[dict[str, Any]]:
-        rows = self._get_json(f"{TWSE_OPENAPI_BASE}/SBL/TWT96U")
+        try:
+            rows = self._get_json(f"{TWSE_OPENAPI_BASE}/SBL/TWT96U")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("無法取得 TWT96U（{}），改以空值繼續：{}", stock_no, exc)
+            return []
         result: list[dict[str, Any]] = []
         for row in rows:
             if row.get("TWSECode") != stock_no:
@@ -848,7 +857,24 @@ class TwseClient:
         ]
 
     def fetch_listed_companies(self) -> list[dict[str, Any]]:
-        return self._get_json(f"{TWSE_OPENAPI_BASE}/opendata/t187ap03_L")
+        try:
+            rows = self._get_json(f"{TWSE_OPENAPI_BASE}/opendata/t187ap03_L")
+            if isinstance(rows, list) and rows:
+                return rows
+            raise RuntimeError("上市公司清單回傳空資料")
+        except Exception as exc:  # noqa: BLE001
+            if LISTED_SNAPSHOT_PATH.exists():
+                with LISTED_SNAPSHOT_PATH.open("r", newline="", encoding="utf-8-sig") as fp:
+                    snapshot_rows = list(csv.DictReader(fp))
+                if snapshot_rows:
+                    logger.warning(
+                        "無法取得 t187ap03_L，改用本地快取 {}（{} 筆）：{}",
+                        LISTED_SNAPSHOT_PATH.name,
+                        len(snapshot_rows),
+                        exc,
+                    )
+                    return snapshot_rows
+            raise
 
     def fetch_issued_shares_day(self, stock_no: str, trading_day: date) -> int | None:
         payload = self._get_json(
@@ -868,7 +894,7 @@ class TwseClient:
         return None
 
     def fetch_issued_shares(self, stock_no: str) -> int:
-        rows = self._get_json(f"{TWSE_OPENAPI_BASE}/opendata/t187ap03_L")
+        rows = self.fetch_listed_companies()
         for row in rows:
             if row.get("公司代號") == stock_no:
                 shares_text = row.get("已發行普通股數或TDR原股發行股數", "0")
@@ -1088,6 +1114,7 @@ def build_market_day_all_rows(
         listed_rows = client.fetch_listed_companies()
     listed_set = {cleanup_cell(row.get("公司代號", "")) for row in listed_rows}
     listed_set.discard("")
+    use_listed_filter = bool(listed_set)
     fallback_shares_by_code = {
         cleanup_cell(row.get("公司代號", "")): cleanup_cell(row.get("已發行普通股數或TDR原股發行股數", ""))
         for row in listed_rows
@@ -1148,7 +1175,7 @@ def build_market_day_all_rows(
 
     rows: list[dict[str, Any]] = []
     for code, price in sorted(price_map.items()):
-        if code not in listed_set:
+        if use_listed_filter and code not in listed_set:
             continue
 
         margin = margin_map.get(code, {})
@@ -1504,7 +1531,11 @@ def run_market_range_all(client: TwseClient, args: argparse.Namespace) -> None:
         return
 
     logger.info("開始抓取全市場：待下載交易日 {}", len(pending_days))
-    listed_rows = client.fetch_listed_companies()
+    try:
+        listed_rows = client.fetch_listed_companies()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("上市公司清單不可用，將不套用上市公司清單過濾：{}", exc)
+        listed_rows = []
     sbl_map = client.fetch_sbl_available_all()
 
     for trading_day, out_file in progress(
