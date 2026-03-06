@@ -8,6 +8,7 @@
 - 支援輸出格式：`CSV`（`UTF-8-SIG`）或 `Parquet`
 - 數值欄位多以字串輸出（保留原始資料樣式，空字串代表無資料）
 - `turnover_ratio_pct`、`adj_*` 為程式計算欄位
+- 逐日抓取流程使用 `exchange-calendars` 的 `XTAI` 交易日曆（非單純週一到週五）
 
 ## 1) `price`（個股日線）
 

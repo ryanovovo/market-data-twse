@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
 
+import exchange_calendars as xcals
 import pyarrow as pa
 import pyarrow.parquet as pq
 from loguru import logger
@@ -22,6 +23,7 @@ TWSE_OPENAPI_BASE = "https://openapi.twse.com.tw/v1"
 TWSE_RWD_ZH_BASE = "https://www.twse.com.tw/rwd/zh"
 MARKET_DAY_FILE_RE = re.compile(r"market_day_all_(\d{4}-\d{2}-\d{2})\.(csv|parquet)$")
 LISTED_SNAPSHOT_PATH = Path(__file__).resolve().with_name("listed_companies_snapshot.csv")
+TWSE_CALENDAR_NAME = "XTAI"
 INSTITUTION_FIELDS = (
     "inst_foreign_buy",
     "inst_foreign_sell",
@@ -47,6 +49,9 @@ class RetryableApiError(RuntimeError):
     """Temporary API error that can be retried with backoff."""
 
 
+_TWSE_CALENDAR: Any | None = None
+
+
 def parse_cli_date(value: str) -> date:
     return datetime.strptime(value, "%Y-%m-%d").date()
 
@@ -58,6 +63,25 @@ def iter_days(start: date, end: date) -> list[date]:
         days.append(current)
         current += timedelta(days=1)
     return days
+
+
+def get_twse_calendar() -> Any:
+    global _TWSE_CALENDAR  # noqa: PLW0603
+    if _TWSE_CALENDAR is None:
+        _TWSE_CALENDAR = xcals.get_calendar(TWSE_CALENDAR_NAME)
+    return _TWSE_CALENDAR
+
+
+def iter_trading_days(start: date, end: date) -> list[date]:
+    if end < start:
+        return []
+    try:
+        calendar = get_twse_calendar()
+        sessions = calendar.sessions_in_range(start.isoformat(), end.isoformat())
+        return [ts.date() for ts in sessions]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("交易日曆不可用，回退為週一到週五：{}", exc)
+        return [day for day in iter_days(start, end) if day.weekday() < 5]
 
 
 def iter_month_starts(start: date, end: date) -> list[date]:
@@ -934,17 +958,14 @@ def discover_market_day_files(out_dir: Path) -> list[tuple[date, Path]]:
 
 def find_latest_trading_day(client: TwseClient, anchor: date | None = None) -> date:
     check_day = anchor or date.today()
-    for _ in range(31):
-        if check_day.weekday() >= 5:
-            check_day -= timedelta(days=1)
-            continue
+    candidates = iter_trading_days(check_day - timedelta(days=62), check_day)
+    for day in reversed(candidates[-31:]):
         try:
-            rows = client.fetch_price_day_all(check_day)
+            rows = client.fetch_price_day_all(day)
             if rows:
-                return check_day
+                return day
         except Exception:  # noqa: BLE001
             pass
-        check_day -= timedelta(days=1)
     raise RuntimeError("找不到最近交易日，請手動指定 --end")
 
 
@@ -1022,7 +1043,7 @@ def run_daily_loop(
 ) -> list[dict[str, Any]]:
     ensure_range(start, end)
     rows: list[dict[str, Any]] = []
-    trading_days = [day for day in iter_days(start, end) if day.weekday() < 5]
+    trading_days = iter_trading_days(start, end)
     for day in progress(
         trading_days,
         desc=progress_desc or f"{stock_no} 日資料",
@@ -1136,9 +1157,7 @@ def build_market_day_all_rows(
         sbl_map = client.fetch_sbl_available_all()
 
     next_day_map: dict[str, dict[str, str]] = {}
-    for day in iter_days(trading_day + timedelta(days=1), trading_day + timedelta(days=10)):
-        if day.weekday() >= 5:
-            continue
+    for day in iter_trading_days(trading_day + timedelta(days=1), trading_day + timedelta(days=31)):
         variation_all = client.fetch_variation_day_all(day)
         target_codes: list[str] = []
         for code, row in variation_all.items():
@@ -1504,7 +1523,7 @@ def run_market_range_all(client: TwseClient, args: argparse.Namespace) -> None:
     pending_days: list[tuple[date, Path]] = []
     market_format = "csv" if args.output_format == "auto" else args.output_format
 
-    trading_days = [day for day in iter_days(args.start, end) if day.weekday() < 5]
+    trading_days = iter_trading_days(args.start, end)
     total_days = len(trading_days)
     for trading_day in progress(
         trading_days,
@@ -1658,7 +1677,7 @@ def run_all_in_one(client: TwseClient, args: argparse.Namespace) -> None:
 
     next_day_price_map: dict[str, dict[str, str]] = {}
     variation_end = end + timedelta(days=10)
-    variation_days = [day for day in iter_days(args.start, variation_end) if day.weekday() < 5]
+    variation_days = iter_trading_days(args.start, variation_end)
     for day in progress(
         variation_days,
         desc=f"all-in-one {args.stock} 次日參考價",

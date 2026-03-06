@@ -34,7 +34,7 @@ uv run main.py <command> ... --delay 1.0
 - `--output-format` 預設 `auto`：依 `--out` 副檔名判斷；若 `--out` 無副檔名則預設 `csv`
 - 使用 `loguru` 輸出執行紀錄（可用 `--log-level` 調整層級）
 - 內建隨機抖動與重試退避（遇到 429/5xx 會自動慢下來）
-- 日資料查詢會自動跳過週末，減少無效請求
+- 日資料查詢會用 `exchange-calendars` 的 `XTAI` 日曆，只抓台股交易日（含排除休市日）
 - 長時間任務會顯示 `tqdm` 進度條
 - 若 `openapi.twse.com.tw` 無法連線，上市公司清單會自動 fallback 到專案內建 `listed_companies_snapshot.csv`
 
