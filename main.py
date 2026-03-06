@@ -42,6 +42,10 @@ INSTITUTION_FIELDS = (
 )
 
 
+class RetryableApiError(RuntimeError):
+    """Temporary API error that can be retried with backoff."""
+
+
 def parse_cli_date(value: str) -> date:
     return datetime.strptime(value, "%Y-%m-%d").date()
 
@@ -261,11 +265,22 @@ class TwseClient:
                     [
                         "curl",
                         "-sS",
+                        "-L",
                         "--compressed",
                         "--connect-timeout",
                         "10",
                         "--max-time",
                         "30",
+                        "-A",
+                        (
+                            "Mozilla/5.0 (X11; Linux x86_64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/122.0.0.0 Safari/537.36"
+                        ),
+                        "-H",
+                        "Accept: application/json, text/plain, */*",
+                        "-e",
+                        "https://www.twse.com.tw/",
                         "-w",
                         "\n__STATUS__:%{http_code}",
                         request_url,
@@ -281,21 +296,32 @@ class TwseClient:
                 status_code = int(status_text.strip())
 
                 if result.returncode != 0:
-                    raise RuntimeError(result.stderr.strip() or f"curl 失敗，code={result.returncode}")
+                    raise RetryableApiError(
+                        result.stderr.strip() or f"curl 失敗，code={result.returncode}"
+                    )
 
                 if status_code in (429, 500, 502, 503, 504):
-                    raise RuntimeError(f"HTTP {status_code}")
+                    raise RetryableApiError(f"HTTP {status_code}")
+                if 300 <= status_code < 400:
+                    raise RuntimeError(f"HTTP {status_code} redirect")
                 if status_code >= 400:
                     raise RuntimeError(f"HTTP {status_code} body={body[:200]}")
+
+                stripped = body.lstrip()
+                if not stripped.startswith("{") and not stripped.startswith("["):
+                    preview = stripped[:200].replace("\n", " ")
+                    raise RuntimeError(f"非 JSON 回應：{preview}")
 
                 payload = json.loads(body)
                 time.sleep(self.delay + random.uniform(0.0, self.jitter))
                 return payload
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                if attempt < 5:
+                if isinstance(exc, RetryableApiError) and attempt < 5:
                     backoff = min(10.0, (self.delay * (2**attempt)))
                     time.sleep(backoff + random.uniform(0.0, self.jitter))
+                else:
+                    break
         raise RuntimeError(f"呼叫 API 失敗: {request_url}") from last_error
 
     def fetch_price_month(self, stock_no: str, month_start: date) -> list[dict[str, Any]]:
@@ -883,6 +909,9 @@ def discover_market_day_files(out_dir: Path) -> list[tuple[date, Path]]:
 def find_latest_trading_day(client: TwseClient, anchor: date | None = None) -> date:
     check_day = anchor or date.today()
     for _ in range(31):
+        if check_day.weekday() >= 5:
+            check_day -= timedelta(days=1)
+            continue
         try:
             rows = client.fetch_price_day_all(check_day)
             if rows:
