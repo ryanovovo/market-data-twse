@@ -12,13 +12,34 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 from loguru import logger
 from tqdm.auto import tqdm
 
 TWSE_BASE = "https://www.twse.com.tw"
 TWSE_OPENAPI_BASE = "https://openapi.twse.com.tw/v1"
 TWSE_RWD_ZH_BASE = "https://www.twse.com.tw/rwd/zh"
-MARKET_DAY_FILE_RE = re.compile(r"market_day_all_(\d{4}-\d{2}-\d{2})\.csv$")
+MARKET_DAY_FILE_RE = re.compile(r"market_day_all_(\d{4}-\d{2}-\d{2})\.(csv|parquet)$")
+INSTITUTION_FIELDS = (
+    "inst_foreign_buy",
+    "inst_foreign_sell",
+    "inst_foreign_net",
+    "inst_foreign_dealer_buy",
+    "inst_foreign_dealer_sell",
+    "inst_foreign_dealer_net",
+    "inst_investment_trust_buy",
+    "inst_investment_trust_sell",
+    "inst_investment_trust_net",
+    "inst_dealer_total_net",
+    "inst_dealer_self_buy",
+    "inst_dealer_self_sell",
+    "inst_dealer_self_net",
+    "inst_dealer_hedge_buy",
+    "inst_dealer_hedge_sell",
+    "inst_dealer_hedge_net",
+    "inst_three_major_net",
+)
 
 
 def parse_cli_date(value: str) -> date:
@@ -143,16 +164,83 @@ def apply_back_adjustment(
     return sorted(adjusted_desc, key=lambda row: row["date"])
 
 
-def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+def resolve_output_path_and_format(path: Path, output_format: str) -> tuple[Path, str]:
+    suffix = path.suffix.lower()
+    if output_format == "auto":
+        if suffix == ".csv":
+            return path, "csv"
+        if suffix == ".parquet":
+            return path, "parquet"
+        if suffix == "":
+            return path.with_suffix(".csv"), "csv"
+        raise ValueError(f"不支援的輸出副檔名：{path}")
+
+    expected_suffix = f".{output_format}"
+    if suffix == "":
+        return path.with_suffix(expected_suffix), output_format
+    if suffix != expected_suffix:
+        raise ValueError(
+            f"--output-format={output_format} 與輸出副檔名不一致：{path}. 請改成 {expected_suffix}"
+        )
+    return path, output_format
+
+
+def normalize_rows(rows: list[dict[str, Any]], fieldnames: list[str]) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    for row in rows:
+        normalized.append({name: cleanup_cell(row.get(name, "")) for name in fieldnames})
+    return normalized
+
+
+def read_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        with path.open("r", newline="", encoding="utf-8-sig") as fp:
+            reader = csv.DictReader(fp)
+            fieldnames = list(reader.fieldnames or [])
+            rows = [{key: cleanup_cell(value) for key, value in row.items()} for row in reader]
+        return fieldnames, rows
+
+    if suffix == ".parquet":
+        table = pq.read_table(path)
+        fieldnames = list(table.schema.names)
+        rows_raw = table.to_pylist()
+        rows: list[dict[str, str]] = []
+        for row in rows_raw:
+            rows.append({name: cleanup_cell(row.get(name, "")) for name in fieldnames})
+        return fieldnames, rows
+
+    raise ValueError(f"不支援的輸入副檔名：{path}")
+
+
+def write_rows(
+    path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    output_format: str = "auto",
+    fieldnames: list[str] | None = None,
+) -> Path:
     if not rows:
         logger.warning("無資料可寫入：{}", path)
-        return
+        return path
+
+    path, resolved_format = resolve_output_path_and_format(path, output_format)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8-sig") as fp:
-        writer = csv.DictWriter(fp, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+    ordered_fields = fieldnames or list(rows[0].keys())
+    normalized_rows = normalize_rows(rows, ordered_fields)
+
+    if resolved_format == "csv":
+        with path.open("w", newline="", encoding="utf-8-sig") as fp:
+            writer = csv.DictWriter(fp, fieldnames=ordered_fields)
+            writer.writeheader()
+            writer.writerows(normalized_rows)
+    else:
+        schema = pa.schema([pa.field(name, pa.string()) for name in ordered_fields])
+        table = pa.Table.from_pylist(normalized_rows, schema=schema)
+        pq.write_table(table, path)
+
     logger.success("已輸出 {} 筆到 {}", len(rows), path)
+    return path
 
 
 class TwseClient:
@@ -531,6 +619,49 @@ class TwseClient:
             rows[cleanup_cell(row[0])] = cleanup_cell(row[3])
         return rows
 
+    def fetch_institution_day_all(self, trading_day: date) -> dict[str, dict[str, Any]]:
+        payload = self._get_json(
+            f"{TWSE_RWD_ZH_BASE}/fund/T86",
+            params={
+                "response": "json",
+                "date": trading_day.strftime("%Y%m%d"),
+                "selectType": "ALLBUT0999",
+            },
+        )
+        if payload.get("stat") != "OK":
+            return {}
+
+        rows: dict[str, dict[str, Any]] = {}
+        for row in payload.get("data", []):
+            code = cleanup_cell(row[0] if len(row) > 0 else "")
+            if not code:
+                continue
+
+            def cell(idx: int) -> str:
+                return cleanup_cell(row[idx]) if len(row) > idx else ""
+
+            rows[code] = {
+                "stock_name": cell(1),
+                "inst_foreign_buy": cell(2),
+                "inst_foreign_sell": cell(3),
+                "inst_foreign_net": cell(4),
+                "inst_foreign_dealer_buy": cell(5),
+                "inst_foreign_dealer_sell": cell(6),
+                "inst_foreign_dealer_net": cell(7),
+                "inst_investment_trust_buy": cell(8),
+                "inst_investment_trust_sell": cell(9),
+                "inst_investment_trust_net": cell(10),
+                "inst_dealer_total_net": cell(11),
+                "inst_dealer_self_buy": cell(12),
+                "inst_dealer_self_sell": cell(13),
+                "inst_dealer_self_net": cell(14),
+                "inst_dealer_hedge_buy": cell(15),
+                "inst_dealer_hedge_sell": cell(16),
+                "inst_dealer_hedge_net": cell(17),
+                "inst_three_major_net": cell(18),
+            }
+        return rows
+
     def fetch_sbl_available_all(self) -> dict[str, str]:
         rows = self._get_json(f"{TWSE_OPENAPI_BASE}/SBL/TWT96U")
         out: dict[str, str] = {}
@@ -673,6 +804,19 @@ class TwseClient:
             )
         return result
 
+    def fetch_institution_day(self, stock_no: str, trading_day: date) -> list[dict[str, Any]]:
+        row = self.fetch_institution_day_all(trading_day).get(stock_no)
+        if not row:
+            return []
+        return [
+            {
+                "date": trading_day.isoformat(),
+                "stock_no": stock_no,
+                "stock_name": cleanup_cell(row.get("stock_name", "")),
+                **{field: cleanup_cell(row.get(field, "")) for field in INSTITUTION_FIELDS},
+            }
+        ]
+
     def fetch_listed_companies(self) -> list[dict[str, Any]]:
         return self._get_json(f"{TWSE_OPENAPI_BASE}/opendata/t187ap03_L")
 
@@ -719,7 +863,7 @@ def configure_logger(level: str) -> None:
 
 def discover_market_day_files(out_dir: Path) -> list[tuple[date, Path]]:
     files: list[tuple[date, Path]] = []
-    for path in out_dir.glob("market_day_all_*.csv"):
+    for path in out_dir.glob("market_day_all_*"):
         match = MARKET_DAY_FILE_RE.fullmatch(path.name)
         if not match:
             continue
@@ -784,7 +928,7 @@ def run_price(client: TwseClient, args: argparse.Namespace) -> None:
             if args.start <= d <= end:
                 all_rows.append(row)
     all_rows.sort(key=lambda row: row["date"])
-    write_csv(args.out, all_rows)
+    write_rows(args.out, all_rows, output_format=args.output_format)
 
 
 def run_adjusted_price(client: TwseClient, args: argparse.Namespace) -> None:
@@ -805,7 +949,7 @@ def run_adjusted_price(client: TwseClient, args: argparse.Namespace) -> None:
 
     events = client.fetch_exright_results(args.stock, args.start, end)
     adjusted_rows = apply_back_adjustment(price_rows, events)
-    write_csv(args.out, adjusted_rows)
+    write_rows(args.out, adjusted_rows, output_format=args.output_format)
 
 
 def run_daily_loop(
@@ -839,7 +983,7 @@ def run_margin(client: TwseClient, args: argparse.Namespace) -> None:
         fetcher=client.fetch_margin_day,
         progress_desc=f"margin {args.stock}",
     )
-    write_csv(args.out, rows)
+    write_rows(args.out, rows, output_format=args.output_format)
 
 
 def run_daytrade(client: TwseClient, args: argparse.Namespace) -> None:
@@ -852,7 +996,7 @@ def run_daytrade(client: TwseClient, args: argparse.Namespace) -> None:
         fetcher=client.fetch_daytrade_day,
         progress_desc=f"daytrade {args.stock}",
     )
-    write_csv(args.out, rows)
+    write_rows(args.out, rows, output_format=args.output_format)
 
 
 def run_credit_quota(client: TwseClient, args: argparse.Namespace) -> None:
@@ -865,12 +1009,12 @@ def run_credit_quota(client: TwseClient, args: argparse.Namespace) -> None:
         fetcher=client.fetch_credit_quota_day,
         progress_desc=f"credit-quota {args.stock}",
     )
-    write_csv(args.out, rows)
+    write_rows(args.out, rows, output_format=args.output_format)
 
 
 def run_sbl(client: TwseClient, args: argparse.Namespace) -> None:
     rows = client.fetch_sbl_available(args.stock)
-    write_csv(args.out, rows)
+    write_rows(args.out, rows, output_format=args.output_format)
 
 
 def run_listed_companies(client: TwseClient, args: argparse.Namespace) -> None:
@@ -897,7 +1041,7 @@ def run_listed_companies(client: TwseClient, args: argparse.Namespace) -> None:
         )
 
     result.sort(key=lambda row: row["stock_no"])
-    write_csv(args.out, result)
+    write_rows(args.out, result, output_format=args.output_format)
 
 
 def build_market_day_all_rows(
@@ -925,6 +1069,7 @@ def build_market_day_all_rows(
     margin_map = client.fetch_margin_day_all(trading_day)
     daytrade_map = client.fetch_daytrade_day_all(trading_day)
     quota_map = client.fetch_credit_quota_day_all(trading_day)
+    institution_map = client.fetch_institution_day_all(trading_day)
     issued_map = client.fetch_issued_shares_day_all(trading_day)
     if sbl_map is None:
         sbl_map = client.fetch_sbl_available_all()
@@ -975,6 +1120,7 @@ def build_market_day_all_rows(
         margin = margin_map.get(code, {})
         daytrade = daytrade_map.get(code, {})
         quota = quota_map.get(code, {})
+        institution = institution_map.get(code, {})
         next_day = next_day_map.get(code, {})
 
         if not daytrade:
@@ -1047,6 +1193,23 @@ def build_market_day_all_rows(
                 "quota_sbl_balance": quota.get("quota_sbl_balance", ""),
                 "quota_sbl_next_limit": quota.get("quota_sbl_next_limit", ""),
                 "quota_note": quota.get("quota_note", ""),
+                "inst_foreign_buy": institution.get("inst_foreign_buy", ""),
+                "inst_foreign_sell": institution.get("inst_foreign_sell", ""),
+                "inst_foreign_net": institution.get("inst_foreign_net", ""),
+                "inst_foreign_dealer_buy": institution.get("inst_foreign_dealer_buy", ""),
+                "inst_foreign_dealer_sell": institution.get("inst_foreign_dealer_sell", ""),
+                "inst_foreign_dealer_net": institution.get("inst_foreign_dealer_net", ""),
+                "inst_investment_trust_buy": institution.get("inst_investment_trust_buy", ""),
+                "inst_investment_trust_sell": institution.get("inst_investment_trust_sell", ""),
+                "inst_investment_trust_net": institution.get("inst_investment_trust_net", ""),
+                "inst_dealer_total_net": institution.get("inst_dealer_total_net", ""),
+                "inst_dealer_self_buy": institution.get("inst_dealer_self_buy", ""),
+                "inst_dealer_self_sell": institution.get("inst_dealer_self_sell", ""),
+                "inst_dealer_self_net": institution.get("inst_dealer_self_net", ""),
+                "inst_dealer_hedge_buy": institution.get("inst_dealer_hedge_buy", ""),
+                "inst_dealer_hedge_sell": institution.get("inst_dealer_hedge_sell", ""),
+                "inst_dealer_hedge_net": institution.get("inst_dealer_hedge_net", ""),
+                "inst_three_major_net": institution.get("inst_three_major_net", ""),
                 "issued_shares": issued,
                 "issued_shares_source": issued_source,
                 "turnover_ratio_pct": f"{turnover:.6f}",
@@ -1059,7 +1222,7 @@ def build_market_day_all_rows(
 
 def run_market_day_all(client: TwseClient, args: argparse.Namespace) -> None:
     rows = build_market_day_all_rows(client, args.date)
-    write_csv(args.out, rows)
+    write_rows(args.out, rows, output_format=args.output_format)
 
 
 def run_market_adj_backfill(client: TwseClient, out_dir: Path) -> None:
@@ -1112,14 +1275,20 @@ def run_market_adj_backfill(client: TwseClient, out_dir: Path) -> None:
         len(factor_lookup),
     )
 
+    listed_rows = client.fetch_listed_companies()
+    industry_by_code = {
+        cleanup_cell(row.get("公司代號", "")): cleanup_cell(row.get("產業別", ""))
+        for row in listed_rows
+        if cleanup_cell(row.get("公司代號", ""))
+    }
+
     updated_files = 0
     updated_rows = 0
     next_daytrade_cache: dict[str, dict[str, dict[str, Any]]] = {}
+    institution_cache: dict[str, dict[str, dict[str, Any]]] = {}
     for day, path in progress(files, desc="回補還原股價", total=len(files)):
-        with path.open("r", newline="", encoding="utf-8-sig") as fp:
-            reader = csv.DictReader(fp)
-            fieldnames = list(reader.fieldnames or [])
-            rows = list(reader)
+        fieldnames, rows = read_rows(path)
+        original_fieldnames = list(fieldnames)
 
         if not rows:
             continue
@@ -1128,10 +1297,14 @@ def run_market_adj_backfill(client: TwseClient, out_dir: Path) -> None:
             if col not in fieldnames:
                 fieldnames.append(col)
         for col in (
+            "industry_code",
             "next_can_daytrade",
             "next_daytrade_type",
             "next_daytrade_suspension_flag",
         ):
+            if col not in fieldnames:
+                fieldnames.append(col)
+        for col in INSTITUTION_FIELDS:
             if col not in fieldnames:
                 fieldnames.append(col)
 
@@ -1152,15 +1325,30 @@ def run_market_adj_backfill(client: TwseClient, out_dir: Path) -> None:
                 next_daytrade_cache[next_trade_day] = {}
 
         day_key = day.isoformat()
+        if day_key not in institution_cache:
+            try:
+                institution_cache[day_key] = client.fetch_institution_day_all(day)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("取得三大法人資料失敗 {}：{}", day_key, exc)
+                institution_cache[day_key] = {}
+
         changed = 0
         header_changed = any(
-            col not in (reader.fieldnames or [])
-            for col in ("next_can_daytrade", "next_daytrade_type", "next_daytrade_suspension_flag")
+            col not in original_fieldnames
+            for col in (
+                "industry_code",
+                "next_can_daytrade",
+                "next_daytrade_type",
+                "next_daytrade_suspension_flag",
+                *INSTITUTION_FIELDS,
+            )
         )
         for row in rows:
             code = cleanup_cell(row.get("stock_no", ""))
             factor = factor_lookup.get(code, {}).get(day_key, 1.0)
             new_factor = f"{factor:.12f}"
+            new_industry_code = industry_by_code.get(code, "")
+            new_institution = institution_cache.get(day_key, {}).get(code, {})
             price_open = parse_float_cell(row.get("price_open", ""))
             price_high = parse_float_cell(row.get("price_high", ""))
             price_low = parse_float_cell(row.get("price_low", ""))
@@ -1169,6 +1357,9 @@ def run_market_adj_backfill(client: TwseClient, out_dir: Path) -> None:
             new_high = f"{price_high * factor:.4f}" if price_high is not None else ""
             new_low = f"{price_low * factor:.4f}" if price_low is not None else ""
             new_close = f"{price_close * factor:.4f}" if price_close is not None else ""
+            new_institution_values = {
+                field: cleanup_cell(new_institution.get(field, "")) for field in INSTITUTION_FIELDS
+            }
 
             next_trade_day = cleanup_cell(row.get("next_trade_date", ""))
             if next_trade_day:
@@ -1192,6 +1383,7 @@ def run_market_adj_backfill(client: TwseClient, out_dir: Path) -> None:
 
             if (
                 row.get("adj_factor_back", "") != new_factor
+                or row.get("industry_code", "") != new_industry_code
                 or row.get("adj_open", "") != new_open
                 or row.get("adj_high", "") != new_high
                 or row.get("adj_low", "") != new_low
@@ -1199,8 +1391,13 @@ def run_market_adj_backfill(client: TwseClient, out_dir: Path) -> None:
                 or row.get("next_can_daytrade", "") != new_next_can_daytrade
                 or row.get("next_daytrade_type", "") != new_next_daytrade_type
                 or row.get("next_daytrade_suspension_flag", "") != new_next_daytrade_flag
+                or any(
+                    row.get(field, "") != new_institution_values[field]
+                    for field in INSTITUTION_FIELDS
+                )
             ):
                 row["adj_factor_back"] = new_factor
+                row["industry_code"] = new_industry_code
                 row["adj_open"] = new_open
                 row["adj_high"] = new_high
                 row["adj_low"] = new_low
@@ -1208,19 +1405,21 @@ def run_market_adj_backfill(client: TwseClient, out_dir: Path) -> None:
                 row["next_can_daytrade"] = new_next_can_daytrade
                 row["next_daytrade_type"] = new_next_daytrade_type
                 row["next_daytrade_suspension_flag"] = new_next_daytrade_flag
+                for field in INSTITUTION_FIELDS:
+                    row[field] = new_institution_values[field]
                 changed += 1
             else:
+                row["industry_code"] = new_industry_code
                 row["next_can_daytrade"] = new_next_can_daytrade
                 row["next_daytrade_type"] = new_next_daytrade_type
                 row["next_daytrade_suspension_flag"] = new_next_daytrade_flag
+                for field in INSTITUTION_FIELDS:
+                    row[field] = new_institution_values[field]
 
         if changed <= 0 and not header_changed:
             continue
 
-        with path.open("w", newline="", encoding="utf-8-sig") as fp:
-            writer = csv.DictWriter(fp, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
+        write_rows(path, rows, output_format="auto", fieldnames=fieldnames)
         updated_files += 1
         updated_rows += changed
 
@@ -1242,6 +1441,7 @@ def run_market_range_all(client: TwseClient, args: argparse.Namespace) -> None:
     empty_days = 0
     failed_days = 0
     pending_days: list[tuple[date, Path]] = []
+    market_format = "csv" if args.output_format == "auto" else args.output_format
 
     trading_days = [day for day in iter_days(args.start, end) if day.weekday() < 5]
     total_days = len(trading_days)
@@ -1250,7 +1450,7 @@ def run_market_range_all(client: TwseClient, args: argparse.Namespace) -> None:
         desc="掃描既有檔案",
         total=total_days,
     ):
-        out_file = args.out_dir / f"market_day_all_{trading_day.isoformat()}.csv"
+        out_file = args.out_dir / f"market_day_all_{trading_day.isoformat()}.{market_format}"
         if out_file.exists() and not args.overwrite:
             skipped_days += 1
             continue
@@ -1289,7 +1489,7 @@ def run_market_range_all(client: TwseClient, args: argparse.Namespace) -> None:
                 empty_days += 1
                 logger.warning("{} 無資料，略過輸出", trading_day.isoformat())
                 continue
-            write_csv(out_file, rows)
+            write_rows(out_file, rows, output_format="auto")
             written_days += 1
         except Exception as exc:  # noqa: BLE001
             failed_days += 1
@@ -1354,7 +1554,7 @@ def run_turnover(client: TwseClient, args: argparse.Namespace) -> None:
             )
 
     rows.sort(key=lambda row: row["date"])
-    write_csv(args.out, rows)
+    write_rows(args.out, rows, output_format=args.output_format)
 
 
 def run_all_in_one(client: TwseClient, args: argparse.Namespace) -> None:
@@ -1434,6 +1634,7 @@ def run_all_in_one(client: TwseClient, args: argparse.Namespace) -> None:
         margin = first_row(client.fetch_margin_day(args.stock, trading_day))
         daytrade = first_row(client.fetch_daytrade_day(args.stock, trading_day))
         quota = first_row(client.fetch_credit_quota_day(args.stock, trading_day))
+        institution = first_row(client.fetch_institution_day(args.stock, trading_day))
         can_daytrade, daytrade_type = resolve_daytrade_status(daytrade)
 
         daily_shares = client.fetch_issued_shares_day(args.stock, trading_day)
@@ -1458,6 +1659,7 @@ def run_all_in_one(client: TwseClient, args: argparse.Namespace) -> None:
                     margin.get("stock_name")
                     or daytrade.get("stock_name")
                     or quota.get("stock_name")
+                    or institution.get("stock_name")
                     or ""
                 ),
                 "industry_code": industry_code,
@@ -1515,6 +1717,23 @@ def run_all_in_one(client: TwseClient, args: argparse.Namespace) -> None:
                 "quota_sbl_balance": quota.get("sbl_balance", ""),
                 "quota_sbl_next_limit": quota.get("sbl_next_limit", ""),
                 "quota_note": quota.get("note", ""),
+                "inst_foreign_buy": institution.get("inst_foreign_buy", ""),
+                "inst_foreign_sell": institution.get("inst_foreign_sell", ""),
+                "inst_foreign_net": institution.get("inst_foreign_net", ""),
+                "inst_foreign_dealer_buy": institution.get("inst_foreign_dealer_buy", ""),
+                "inst_foreign_dealer_sell": institution.get("inst_foreign_dealer_sell", ""),
+                "inst_foreign_dealer_net": institution.get("inst_foreign_dealer_net", ""),
+                "inst_investment_trust_buy": institution.get("inst_investment_trust_buy", ""),
+                "inst_investment_trust_sell": institution.get("inst_investment_trust_sell", ""),
+                "inst_investment_trust_net": institution.get("inst_investment_trust_net", ""),
+                "inst_dealer_total_net": institution.get("inst_dealer_total_net", ""),
+                "inst_dealer_self_buy": institution.get("inst_dealer_self_buy", ""),
+                "inst_dealer_self_sell": institution.get("inst_dealer_self_sell", ""),
+                "inst_dealer_self_net": institution.get("inst_dealer_self_net", ""),
+                "inst_dealer_hedge_buy": institution.get("inst_dealer_hedge_buy", ""),
+                "inst_dealer_hedge_sell": institution.get("inst_dealer_hedge_sell", ""),
+                "inst_dealer_hedge_net": institution.get("inst_dealer_hedge_net", ""),
+                "inst_three_major_net": institution.get("inst_three_major_net", ""),
                 "issued_shares": str(issued_shares),
                 "issued_shares_source": shares_source,
                 "turnover_ratio_pct": f"{turnover:.6f}",
@@ -1522,7 +1741,7 @@ def run_all_in_one(client: TwseClient, args: argparse.Namespace) -> None:
             }
         )
 
-    write_csv(args.out, merged_rows)
+    write_rows(args.out, merged_rows, output_format=args.output_format)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1541,6 +1760,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR"],
         help="loguru 日誌等級 (預設: INFO)",
     )
+    parser.add_argument(
+        "--output-format",
+        default="auto",
+        choices=["auto", "csv", "parquet"],
+        help="輸出格式：auto(依副檔名判斷，無副檔名預設 csv) / csv / parquet",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1552,7 +1777,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_cli_date,
         help="結束日 YYYY-MM-DD（可省略，預設最近交易日）",
     )
-    price_parser.add_argument("--out", type=Path, required=True, help="輸出 CSV 路徑")
+    price_parser.add_argument("--out", type=Path, required=True, help="輸出路徑（.csv 或 .parquet）")
 
     adj_price_parser = subparsers.add_parser(
         "adjusted-price",
@@ -1565,7 +1790,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_cli_date,
         help="結束日 YYYY-MM-DD（可省略，預設最近交易日）",
     )
-    adj_price_parser.add_argument("--out", type=Path, required=True, help="輸出 CSV 路徑")
+    adj_price_parser.add_argument("--out", type=Path, required=True, help="輸出路徑（.csv 或 .parquet）")
 
     margin_parser = subparsers.add_parser("margin", help="抓融資融券 (MI_MARGN)")
     margin_parser.add_argument("--stock", required=True, help="股票代號，例如 2330")
@@ -1575,7 +1800,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_cli_date,
         help="結束日 YYYY-MM-DD（可省略，預設最近交易日）",
     )
-    margin_parser.add_argument("--out", type=Path, required=True, help="輸出 CSV 路徑")
+    margin_parser.add_argument("--out", type=Path, required=True, help="輸出路徑（.csv 或 .parquet）")
 
     daytrade_parser = subparsers.add_parser("daytrade", help="抓當沖成交資訊 (TWTB4U)")
     daytrade_parser.add_argument("--stock", required=True, help="股票代號，例如 2330")
@@ -1585,7 +1810,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_cli_date,
         help="結束日 YYYY-MM-DD（可省略，預設最近交易日）",
     )
-    daytrade_parser.add_argument("--out", type=Path, required=True, help="輸出 CSV 路徑")
+    daytrade_parser.add_argument("--out", type=Path, required=True, help="輸出路徑（.csv 或 .parquet）")
 
     credit_parser = subparsers.add_parser(
         "credit-quota",
@@ -1598,21 +1823,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_cli_date,
         help="結束日 YYYY-MM-DD（可省略，預設最近交易日）",
     )
-    credit_parser.add_argument("--out", type=Path, required=True, help="輸出 CSV 路徑")
+    credit_parser.add_argument("--out", type=Path, required=True, help="輸出路徑（.csv 或 .parquet）")
 
     sbl_parser = subparsers.add_parser("sbl", help="抓上市可借券賣出股數快照 (TWT96U)")
     sbl_parser.add_argument("--stock", required=True, help="股票代號，例如 2330")
-    sbl_parser.add_argument("--out", type=Path, required=True, help="輸出 CSV 路徑")
+    sbl_parser.add_argument("--out", type=Path, required=True, help="輸出路徑（.csv 或 .parquet）")
 
     listed_parser = subparsers.add_parser("listed-companies", help="抓所有上市公司清單 (t187ap03_L)")
-    listed_parser.add_argument("--out", type=Path, required=True, help="輸出 CSV 路徑")
+    listed_parser.add_argument("--out", type=Path, required=True, help="輸出路徑（.csv 或 .parquet）")
 
     market_day_parser = subparsers.add_parser(
         "market-day-all",
         help="抓單日全市場上市公司整合資料",
     )
     market_day_parser.add_argument("--date", type=parse_cli_date, required=True, help="日期 YYYY-MM-DD")
-    market_day_parser.add_argument("--out", type=Path, required=True, help="輸出 CSV 路徑")
+    market_day_parser.add_argument("--out", type=Path, required=True, help="輸出路徑（.csv 或 .parquet）")
 
     market_range_parser = subparsers.add_parser(
         "market-range-all",
@@ -1630,7 +1855,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--out-dir",
         type=Path,
         default=Path("data"),
-        help="輸出資料夾（預設: data）",
+        help="輸出資料夾（預設: data；檔名副檔名由 --output-format 決定）",
     )
     market_range_parser.add_argument(
         "--overwrite",
@@ -1659,7 +1884,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_cli_date,
         help="結束日 YYYY-MM-DD（可省略，預設最近交易日）",
     )
-    turnover_parser.add_argument("--out", type=Path, required=True, help="輸出 CSV 路徑")
+    turnover_parser.add_argument("--out", type=Path, required=True, help="輸出路徑（.csv 或 .parquet）")
     turnover_parser.add_argument(
         "--shares",
         type=int,
@@ -1668,7 +1893,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     all_parser = subparsers.add_parser(
         "all-in-one",
-        help="整合股價(含還原/次一交易日價位)/信用交易/周轉率到單一 CSV",
+        help="整合股價(含還原/次一交易日價位)/信用交易/周轉率到單一檔案",
     )
     all_parser.add_argument("--stock", required=True, help="股票代號，例如 2330")
     all_parser.add_argument("--start", type=parse_cli_date, required=True, help="起始日 YYYY-MM-DD")
@@ -1677,7 +1902,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_cli_date,
         help="結束日 YYYY-MM-DD（可省略，預設最近交易日）",
     )
-    all_parser.add_argument("--out", type=Path, required=True, help="輸出 CSV 路徑")
+    all_parser.add_argument("--out", type=Path, required=True, help="輸出路徑（.csv 或 .parquet）")
     all_parser.add_argument(
         "--shares",
         type=int,

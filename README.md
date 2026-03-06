@@ -7,6 +7,7 @@
 - 當沖交易資訊
 - 每日周轉率（以成交股數計算）
 - 信用額度總量管制餘額表（融券/借券賣出餘額）
+- 三大法人買賣超（外資/投信/自營商）
 - 可借券賣出股數（借券可用量快照）
 - 所有上市公司清單
 
@@ -19,7 +20,7 @@ uv sync
 ## 2. 指令用法
 
 ```bash
-uv run main.py [--delay 1.0] [--log-level INFO] <command> --stock <股票代號> --start <YYYY-MM-DD> [--end <YYYY-MM-DD>] --out <輸出CSV>
+uv run main.py [--delay 1.0] [--log-level INFO] [--output-format auto|csv|parquet] <command> --stock <股票代號> --start <YYYY-MM-DD> [--end <YYYY-MM-DD>] --out <輸出路徑>
 ```
 
 可選節流參數（建議批次抓取時加大）：
@@ -30,6 +31,7 @@ uv run main.py <command> ... --delay 1.0
 
 - 預設 `--delay 1.0` 秒
 - `--end` 可省略，會自動使用最近一個交易日
+- `--output-format` 預設 `auto`：依 `--out` 副檔名判斷；若 `--out` 無副檔名則預設 `csv`
 - 使用 `loguru` 輸出執行紀錄（可用 `--log-level` 調整層級）
 - 內建隨機抖動與重試退避（遇到 429/5xx 會自動慢下來）
 - 日資料查詢會自動跳過週末，減少無效請求
@@ -89,17 +91,29 @@ uv run main.py market-day-all --date 2026-03-06 --out data/market_day_all_2026-0
 uv run main.py market-range-all --start 2018-01-01 --end 2025-12-31
 ```
 
+輸出 parquet 範例：
+
+```bash
+uv run main.py --output-format parquet market-range-all --start 2018-01-01 --end 2025-12-31
+```
+
 - 每個交易日輸出一個檔案：`data/market_day_all_YYYY-MM-DD.csv`
 - `--out-dir` 預設為 `data`
 - 若該日檔案已存在，會自動跳過不重抓
-- 下載後會自動檢查 `TWT49U` 並回補既有檔案的 `adj_factor_back/adj_open/adj_high/adj_low/adj_close`
+- 下載後會自動回補既有檔案：`adj_*`（`TWT49U`）、`industry_code`、`next_*daytrade`、`inst_*`（三大法人）
 - 如需覆蓋重抓可加 `--overwrite`
 - 如需略過回補可加 `--skip-adj-backfill`
 
-### 一次整合全部到單一 CSV
+### 一次整合全部到單一檔案（CSV / Parquet）
 
 ```bash
 uv run main.py all-in-one --stock 2330 --start 2026-02-20 --end 2026-03-06 --out data/2330_all_in_one.csv
+```
+
+輸出 parquet 範例：
+
+```bash
+uv run main.py all-in-one --stock 2330 --start 2026-02-20 --end 2026-03-06 --out data/2330_all_in_one.parquet
 ```
 
 可選：自行指定流通股數（不使用 API 回傳的已發行股數）
@@ -143,6 +157,7 @@ uv run main.py turnover --stock 2330 --start 2026-02-20 --end 2026-03-06 --share
 - 融資融券：`https://www.twse.com.tw/exchangeReport/MI_MARGN`
 - 當沖交易：`https://www.twse.com.tw/exchangeReport/TWTB4U`
 - 信用額度總量管制餘額表：`https://www.twse.com.tw/exchangeReport/TWT93U`
+- 三大法人買賣超：`https://www.twse.com.tw/rwd/zh/fund/T86`
 - 上市可借券賣出股數：`https://openapi.twse.com.tw/v1/SBL/TWT96U`
 - 每日發行股數：`https://www.twse.com.tw/fund/MI_QFIIS`
 - 公司基本資料（取股數）：`https://openapi.twse.com.tw/v1/opendata/t187ap03_L`
@@ -158,6 +173,7 @@ uv run main.py turnover --stock 2330 --start 2026-02-20 --end 2026-03-06 --share
 - 融資融券（MI_MARGN）
 - 當沖（TWTB4U，含 `can_daytrade`、`daytrade_type`）
 - 信用額度總量管制 / 借券賣出餘額（TWT93U）
+- 三大法人買賣超（T86，`inst_*` 欄位）
 - 日周轉率（STOCK_DAY + MI_QFIIS / t187ap03_L）
 - 最新可借券賣出股數快照（TWT96U，欄位 `sbl_available_volume_latest`）
 

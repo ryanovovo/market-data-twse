@@ -5,7 +5,7 @@
 ## 通用規則
 
 - 日期格式：`YYYY-MM-DD`
-- 檔案編碼：`UTF-8-SIG`
+- 支援輸出格式：`CSV`（`UTF-8-SIG`）或 `Parquet`
 - 數值欄位多以字串輸出（保留原始資料樣式，空字串代表無資料）
 - `turnover_ratio_pct`、`adj_*` 為程式計算欄位
 
@@ -194,6 +194,23 @@
 | `quota_sbl_balance` | `numeric string` | 借券賣出當日餘額（股），公式：前日餘額 + 當日賣出 - 當日還券 + 當日調整。法規另有借券餘額上限（個別 10%、與融券合併 25%，詳第 13 節）。 | `TWT93U` 欄位「當日餘額」與官方 notes |
 | `quota_sbl_next_limit` | `numeric string` | 次一營業日可借券賣出限額（股）。與「前 30 個營業日日平均成交量 30%」總量控管規則相關（詳第 13 節）。 | `TWT93U` 欄位「次一營業日可限額」 |
 | `quota_note` | `string` | 信用交易備註符號（可同時多符號）；符號意義見第 11 節。 | `TWT93U` 欄位「備註」 |
+| `inst_foreign_buy` | `numeric string` | 外陸資買進股數（不含外資自營商）。 | `T86` 欄位「外陸資買進股數(不含外資自營商)」 |
+| `inst_foreign_sell` | `numeric string` | 外陸資賣出股數（不含外資自營商）。 | `T86` 欄位「外陸資賣出股數(不含外資自營商)」 |
+| `inst_foreign_net` | `signed numeric string` | 外陸資買賣超股數（不含外資自營商）。 | `T86` 欄位「外陸資買賣超股數(不含外資自營商)」 |
+| `inst_foreign_dealer_buy` | `numeric string` | 外資自營商買進股數。 | `T86` 欄位「外資自營商買進股數」 |
+| `inst_foreign_dealer_sell` | `numeric string` | 外資自營商賣出股數。 | `T86` 欄位「外資自營商賣出股數」 |
+| `inst_foreign_dealer_net` | `signed numeric string` | 外資自營商買賣超股數。 | `T86` 欄位「外資自營商買賣超股數」 |
+| `inst_investment_trust_buy` | `numeric string` | 投信買進股數。 | `T86` 欄位「投信買進股數」 |
+| `inst_investment_trust_sell` | `numeric string` | 投信賣出股數。 | `T86` 欄位「投信賣出股數」 |
+| `inst_investment_trust_net` | `signed numeric string` | 投信買賣超股數。 | `T86` 欄位「投信買賣超股數」 |
+| `inst_dealer_total_net` | `signed numeric string` | 自營商買賣超股數（合計，含自行買賣與避險）。 | `T86` 欄位「自營商買賣超股數」 |
+| `inst_dealer_self_buy` | `numeric string` | 自營商（自行買賣）買進股數。 | `T86` 欄位「自營商買進股數(自行買賣)」 |
+| `inst_dealer_self_sell` | `numeric string` | 自營商（自行買賣）賣出股數。 | `T86` 欄位「自營商賣出股數(自行買賣)」 |
+| `inst_dealer_self_net` | `signed numeric string` | 自營商（自行買賣）買賣超股數。 | `T86` 欄位「自營商買賣超股數(自行買賣)」 |
+| `inst_dealer_hedge_buy` | `numeric string` | 自營商（避險）買進股數。 | `T86` 欄位「自營商買進股數(避險)」 |
+| `inst_dealer_hedge_sell` | `numeric string` | 自營商（避險）賣出股數。 | `T86` 欄位「自營商賣出股數(避險)」 |
+| `inst_dealer_hedge_net` | `signed numeric string` | 自營商（避險）買賣超股數。 | `T86` 欄位「自營商買賣超股數(避險)」 |
+| `inst_three_major_net` | `signed numeric string` | 三大法人買賣超股數（外資 + 投信 + 自營商）。 | `T86` 欄位「三大法人買賣超股數」 |
 | `issued_shares` | `numeric string` | 計算周轉率使用的已發行股數（股）。優先用當日 `MI_QFIIS.發行股數`，無資料則回退 `t187ap03_L`。 | `MI_QFIIS` / `t187ap03_L` |
 | `issued_shares_source` | `enum string` | `issued_shares` 的來源標記，值為 `MI_QFIIS` 或 `t187ap03_L`。 | 程式標記 |
 | `turnover_ratio_pct` | `decimal string` | 當日周轉率（%）=`price_volume / issued_shares * 100`，輸出到小數點後 6 位。 | 程式計算 |
@@ -209,6 +226,7 @@
 - 融資融券欄位名稱同 `market-day-all`，使用 `margn_*` 前綴
 - 當沖欄位包含 `daytrade_suspension_flag`
 - 信用額度欄位使用 `quota_*` 前綴
+- 含三大法人欄位：`inst_*`（`T86`）
 - `sbl_available_volume_latest` 為該股票最新可借券賣出股數快照
 
 ## 11) 信用交易備註符號（`TWT93U`）
@@ -251,6 +269,7 @@
 - [`MI_MARGN` 融資融券彙總](https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date=20260306&selectType=ALL)
 - [`TWTB4U` 當日沖銷交易標的及成交量值](https://www.twse.com.tw/exchangeReport/TWTB4U?response=json&date=20260306)
 - [`TWT93U` 信用額度總量管制餘額表（含符號說明）](https://www.twse.com.tw/exchangeReport/TWT93U?response=json&date=20260306)
+- [`T86` 三大法人買賣超日報](https://www.twse.com.tw/rwd/zh/fund/T86?date=20260306&selectType=ALLBUT0999&response=json)
 - [`MI_QFIIS` 發行股數與外資持股資訊](https://www.twse.com.tw/fund/MI_QFIIS?response=json&date=20260306&selectType=ALLBUT0999)
 - [`TWT96U` 上市可借券賣出股數（快照）](https://openapi.twse.com.tw/v1/SBL/TWT96U)
 - [`t187ap03_L` 上市公司基本資料（含已發行股數）](https://openapi.twse.com.tw/v1/opendata/t187ap03_L)
