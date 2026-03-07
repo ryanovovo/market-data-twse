@@ -350,13 +350,15 @@ class TwseClient:
         raise RuntimeError(f"呼叫 API 失敗: {request_url}") from last_error
 
     def fetch_price_month(self, stock_no: str, month_start: date) -> list[dict[str, Any]]:
-        payload = self._get_json(
+        payload = self._get_json_with_fallback(
+            f"STOCK_DAY {stock_no} {month_start.strftime('%Y-%m')}",
             f"{TWSE_BASE}/exchangeReport/STOCK_DAY",
             params={
                 "response": "json",
                 "date": month_start.strftime("%Y%m01"),
                 "stockNo": stock_no,
             },
+            default={},
         )
         if payload.get("stat") != "OK":
             return []
@@ -381,13 +383,15 @@ class TwseClient:
         return rows
 
     def fetch_price_day_all(self, trading_day: date) -> dict[str, dict[str, Any]]:
-        payload = self._get_json(
+        payload = self._get_json_with_fallback(
+            f"MI_INDEX(all) {trading_day.isoformat()}",
             f"{TWSE_RWD_ZH_BASE}/afterTrading/MI_INDEX",
             params={
                 "response": "json",
                 "date": trading_day.strftime("%Y%m%d"),
                 "type": "ALLBUT0999",
             },
+            default={},
         )
         if payload.get("stat") != "OK":
             return {}
@@ -438,35 +442,43 @@ class TwseClient:
         start: date,
         end: date,
     ) -> list[dict[str, Any]]:
-        payload = self._get_json(
-            f"{TWSE_RWD_ZH_BASE}/exRight/TWT49U",
-            params={
-                "response": "json",
-                "startDate": start.strftime("%Y%m%d"),
-                "endDate": end.strftime("%Y%m%d"),
-            },
-        )
-        if payload.get("stat") != "OK":
-            return []
-
         rows: list[dict[str, Any]] = []
-        for row in payload.get("data", []):
-            if row[1] != stock_no:
-                continue
-            event_date = parse_roc_text_date(cleanup_cell(row[0]))
-            pre_close = parse_float_cell(row[3])
-            ref_price = parse_float_cell(row[4])
-            factor = 1.0
-            if pre_close and ref_price and pre_close > 0:
-                factor = ref_price / pre_close
-            rows.append(
-                {
-                    "event_date": event_date,
-                    "pre_close": pre_close,
-                    "ref_price": ref_price,
-                    "factor": factor,
-                }
+        for month_start in iter_month_starts(start, end):
+            if month_start.month == 12:
+                next_month = date(month_start.year + 1, 1, 1)
+            else:
+                next_month = date(month_start.year, month_start.month + 1, 1)
+            month_end = min(end, next_month - timedelta(days=1))
+            payload = self._get_json_with_fallback(
+                f"TWT49U({stock_no}) {month_start.isoformat()}~{month_end.isoformat()}",
+                f"{TWSE_RWD_ZH_BASE}/exRight/TWT49U",
+                params={
+                    "response": "json",
+                    "startDate": month_start.strftime("%Y%m%d"),
+                    "endDate": month_end.strftime("%Y%m%d"),
+                },
+                default={},
             )
+            if payload.get("stat") != "OK":
+                continue
+
+            for row in payload.get("data", []):
+                if row[1] != stock_no:
+                    continue
+                event_date = parse_roc_text_date(cleanup_cell(row[0]))
+                pre_close = parse_float_cell(row[3])
+                ref_price = parse_float_cell(row[4])
+                factor = 1.0
+                if pre_close and ref_price and pre_close > 0:
+                    factor = ref_price / pre_close
+                rows.append(
+                    {
+                        "event_date": event_date,
+                        "pre_close": pre_close,
+                        "ref_price": ref_price,
+                        "factor": factor,
+                    }
+                )
         return rows
 
     def fetch_exright_results_all(
@@ -474,42 +486,52 @@ class TwseClient:
         start: date,
         end: date,
     ) -> dict[str, list[dict[str, Any]]]:
-        payload = self._get_json(
-            f"{TWSE_RWD_ZH_BASE}/exRight/TWT49U",
-            params={
-                "response": "json",
-                "startDate": start.strftime("%Y%m%d"),
-                "endDate": end.strftime("%Y%m%d"),
-            },
-        )
-        if payload.get("stat") != "OK":
-            return {}
-
         result: dict[str, list[dict[str, Any]]] = {}
-        for row in payload.get("data", []):
-            code = cleanup_cell(row[1] if len(row) > 1 else "")
-            if not code:
+        for month_start in iter_month_starts(start, end):
+            if month_start.month == 12:
+                next_month = date(month_start.year + 1, 1, 1)
+            else:
+                next_month = date(month_start.year, month_start.month + 1, 1)
+            month_end = min(end, next_month - timedelta(days=1))
+            payload = self._get_json_with_fallback(
+                f"TWT49U(all) {month_start.isoformat()}~{month_end.isoformat()}",
+                f"{TWSE_RWD_ZH_BASE}/exRight/TWT49U",
+                params={
+                    "response": "json",
+                    "startDate": month_start.strftime("%Y%m%d"),
+                    "endDate": month_end.strftime("%Y%m%d"),
+                },
+                default={},
+            )
+            if payload.get("stat") != "OK":
                 continue
-            try:
-                event_date = parse_roc_text_date(cleanup_cell(row[0]))
-            except ValueError:
-                continue
-            pre_close = parse_float_cell(row[3] if len(row) > 3 else "")
-            ref_price = parse_float_cell(row[4] if len(row) > 4 else "")
-            factor = 1.0
-            if pre_close and ref_price and pre_close > 0:
-                factor = ref_price / pre_close
-            result.setdefault(code, []).append({"event_date": event_date, "factor": factor})
+
+            for row in payload.get("data", []):
+                code = cleanup_cell(row[1] if len(row) > 1 else "")
+                if not code:
+                    continue
+                try:
+                    event_date = parse_roc_text_date(cleanup_cell(row[0]))
+                except ValueError:
+                    continue
+                pre_close = parse_float_cell(row[3] if len(row) > 3 else "")
+                ref_price = parse_float_cell(row[4] if len(row) > 4 else "")
+                factor = 1.0
+                if pre_close and ref_price and pre_close > 0:
+                    factor = ref_price / pre_close
+                result.setdefault(code, []).append({"event_date": event_date, "factor": factor})
         return result
 
     def fetch_variation_day(self, stock_no: str, trading_day: date) -> dict[str, Any] | None:
-        payload = self._get_json(
+        payload = self._get_json_with_fallback(
+            f"TWT84U {stock_no} {trading_day.isoformat()}",
             f"{TWSE_RWD_ZH_BASE}/variation/TWT84U",
             params={
                 "response": "json",
                 "date": trading_day.strftime("%Y%m%d"),
                 "selectType": "ALLBUT0999",
             },
+            default={},
         )
         if payload.get("stat") != "OK":
             return None
@@ -532,13 +554,15 @@ class TwseClient:
         return None
 
     def fetch_variation_day_all(self, trading_day: date) -> dict[str, dict[str, Any]]:
-        payload = self._get_json(
+        payload = self._get_json_with_fallback(
+            f"TWT84U(all) {trading_day.isoformat()}",
             f"{TWSE_RWD_ZH_BASE}/variation/TWT84U",
             params={
                 "response": "json",
                 "date": trading_day.strftime("%Y%m%d"),
                 "selectType": "ALLBUT0999",
             },
+            default={},
         )
         if payload.get("stat") != "OK":
             return {}
@@ -560,13 +584,15 @@ class TwseClient:
         return rows
 
     def fetch_margin_day_all(self, trading_day: date) -> dict[str, dict[str, Any]]:
-        payload = self._get_json(
+        payload = self._get_json_with_fallback(
+            f"MI_MARGN(all) {trading_day.isoformat()}",
             f"{TWSE_BASE}/exchangeReport/MI_MARGN",
             params={
                 "response": "json",
                 "date": trading_day.strftime("%Y%m%d"),
                 "selectType": "ALL",
             },
+            default={},
         )
         if payload.get("stat") != "OK":
             return {}
@@ -595,12 +621,14 @@ class TwseClient:
         return rows
 
     def fetch_daytrade_day_all(self, trading_day: date) -> dict[str, dict[str, Any]]:
-        payload = self._get_json(
+        payload = self._get_json_with_fallback(
+            f"TWTB4U(all) {trading_day.isoformat()}",
             f"{TWSE_BASE}/exchangeReport/TWTB4U",
             params={
                 "response": "json",
                 "date": trading_day.strftime("%Y%m%d"),
             },
+            default={},
         )
         if payload.get("stat") != "OK":
             return {}
@@ -627,12 +655,14 @@ class TwseClient:
         return rows
 
     def fetch_credit_quota_day_all(self, trading_day: date) -> dict[str, dict[str, Any]]:
-        payload = self._get_json(
+        payload = self._get_json_with_fallback(
+            f"TWT93U(all) {trading_day.isoformat()}",
             f"{TWSE_BASE}/exchangeReport/TWT93U",
             params={
                 "response": "json",
                 "date": trading_day.strftime("%Y%m%d"),
             },
+            default={},
         )
         if payload.get("stat") != "OK":
             return {}
@@ -658,13 +688,15 @@ class TwseClient:
         return rows
 
     def fetch_issued_shares_day_all(self, trading_day: date) -> dict[str, str]:
-        payload = self._get_json(
+        payload = self._get_json_with_fallback(
+            f"MI_QFIIS(all) {trading_day.isoformat()}",
             f"{TWSE_BASE}/fund/MI_QFIIS",
             params={
                 "response": "json",
                 "date": trading_day.strftime("%Y%m%d"),
                 "selectType": "ALLBUT0999",
             },
+            default={},
         )
         if payload.get("stat") != "OK":
             return {}
@@ -675,13 +707,15 @@ class TwseClient:
         return rows
 
     def fetch_institution_day_all(self, trading_day: date) -> dict[str, dict[str, Any]]:
-        payload = self._get_json(
+        payload = self._get_json_with_fallback(
+            f"T86(all) {trading_day.isoformat()}",
             f"{TWSE_RWD_ZH_BASE}/fund/T86",
             params={
                 "response": "json",
                 "date": trading_day.strftime("%Y%m%d"),
                 "selectType": "ALLBUT0999",
             },
+            default={},
         )
         if payload.get("stat") != "OK":
             return {}
@@ -732,13 +766,15 @@ class TwseClient:
         return out
 
     def fetch_margin_day(self, stock_no: str, trading_day: date) -> list[dict[str, Any]]:
-        payload = self._get_json(
+        payload = self._get_json_with_fallback(
+            f"MI_MARGN {stock_no} {trading_day.isoformat()}",
             f"{TWSE_BASE}/exchangeReport/MI_MARGN",
             params={
                 "response": "json",
                 "date": trading_day.strftime("%Y%m%d"),
                 "selectType": "ALL",
             },
+            default={},
         )
         if payload.get("stat") != "OK":
             return []
@@ -773,12 +809,14 @@ class TwseClient:
         return result
 
     def fetch_daytrade_day(self, stock_no: str, trading_day: date) -> list[dict[str, Any]]:
-        payload = self._get_json(
+        payload = self._get_json_with_fallback(
+            f"TWTB4U {stock_no} {trading_day.isoformat()}",
             f"{TWSE_BASE}/exchangeReport/TWTB4U",
             params={
                 "response": "json",
                 "date": trading_day.strftime("%Y%m%d"),
             },
+            default={},
         )
         if payload.get("stat") != "OK":
             return []
@@ -813,12 +851,14 @@ class TwseClient:
         return result
 
     def fetch_credit_quota_day(self, stock_no: str, trading_day: date) -> list[dict[str, Any]]:
-        payload = self._get_json(
+        payload = self._get_json_with_fallback(
+            f"TWT93U {stock_no} {trading_day.isoformat()}",
             f"{TWSE_BASE}/exchangeReport/TWT93U",
             params={
                 "response": "json",
                 "date": trading_day.strftime("%Y%m%d"),
             },
+            default={},
         )
         if payload.get("stat") != "OK":
             return []
@@ -901,13 +941,15 @@ class TwseClient:
             raise
 
     def fetch_issued_shares_day(self, stock_no: str, trading_day: date) -> int | None:
-        payload = self._get_json(
+        payload = self._get_json_with_fallback(
+            f"MI_QFIIS {stock_no} {trading_day.isoformat()}",
             f"{TWSE_BASE}/fund/MI_QFIIS",
             params={
                 "response": "json",
                 "date": trading_day.strftime("%Y%m%d"),
                 "selectType": "ALLBUT0999",
             },
+            default={},
         )
         if payload.get("stat") != "OK":
             return None
@@ -929,6 +971,24 @@ class TwseClient:
 def ensure_range(start: date, end: date) -> None:
     if end < start:
         raise ValueError("--end 必須大於或等於 --start")
+
+
+def is_recoverable_download_error(exc: Exception) -> bool:
+    patterns = (
+        "呼叫 API 失敗",
+        "非 JSON 回應",
+        "HTTP ",
+        "curl 失敗",
+        "timed out",
+        "Operation timed out",
+    )
+    current: BaseException | None = exc
+    while current is not None:
+        text = str(current)
+        if any(pattern in text for pattern in patterns):
+            return True
+        current = current.__cause__
+    return False
 
 
 def configure_logger(level: str) -> None:
@@ -1148,6 +1208,9 @@ def build_market_day_all_rows(
     }
 
     price_map = client.fetch_price_day_all(trading_day)
+    if not price_map:
+        logger.warning("{} MI_INDEX 無資料，略過該交易日", trading_day.isoformat())
+        return []
     margin_map = client.fetch_margin_day_all(trading_day)
     daytrade_map = client.fetch_daytrade_day_all(trading_day)
     quota_map = client.fetch_credit_quota_day_all(trading_day)
@@ -1321,7 +1384,11 @@ def run_market_adj_backfill(client: TwseClient, out_dir: Path) -> None:
         end_day.isoformat(),
     )
 
-    events_by_stock = client.fetch_exright_results_all(start_day, end_day)
+    try:
+        events_by_stock = client.fetch_exright_results_all(start_day, end_day)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("取得 TWT49U 回補資料失敗，改為略過還原係數回補：{}", exc)
+        events_by_stock = {}
     if not events_by_stock:
         logger.info("查無除權息事件，僅執行次日當沖欄位回補")
 
@@ -1355,7 +1422,11 @@ def run_market_adj_backfill(client: TwseClient, out_dir: Path) -> None:
         len(factor_lookup),
     )
 
-    listed_rows = client.fetch_listed_companies()
+    try:
+        listed_rows = client.fetch_listed_companies()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("取得上市公司清單失敗，略過 industry_code 回補：{}", exc)
+        listed_rows = []
     industry_by_code = {
         cleanup_cell(row.get("公司代號", "")): cleanup_cell(row.get("產業別", ""))
         for row in listed_rows
@@ -1546,7 +1617,10 @@ def run_market_range_all(client: TwseClient, args: argparse.Namespace) -> None:
             failed_days,
         )
         if not args.skip_adj_backfill:
-            run_market_adj_backfill(client, args.out_dir)
+            try:
+                run_market_adj_backfill(client, args.out_dir)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("回補階段失敗（已保留下載結果）：{}", exc)
         return
 
     logger.info("開始抓取全市場：待下載交易日 {}", len(pending_days))
@@ -1578,6 +1652,9 @@ def run_market_range_all(client: TwseClient, args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             failed_days += 1
             logger.error("{} 下載失敗：{}", trading_day.isoformat(), exc)
+            if args.continue_on_error or is_recoverable_download_error(exc):
+                logger.warning("{} 已略過並繼續下載後續交易日", trading_day.isoformat())
+                continue
             if not args.continue_on_error:
                 raise
 
@@ -1592,7 +1669,10 @@ def run_market_range_all(client: TwseClient, args: argparse.Namespace) -> None:
     if args.skip_adj_backfill:
         logger.warning("已指定 --skip-adj-backfill，略過還原回補")
     else:
-        run_market_adj_backfill(client, args.out_dir)
+        try:
+            run_market_adj_backfill(client, args.out_dir)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("回補階段失敗（已保留下載結果）：{}", exc)
 
 
 def run_turnover(client: TwseClient, args: argparse.Namespace) -> None:

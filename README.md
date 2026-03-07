@@ -37,6 +37,7 @@ uv run main.py <command> ... --delay 1.0
 - 日資料查詢會用 `exchange-calendars` 的 `XTAI` 日曆，只抓台股交易日（含排除休市日）
 - 長時間任務會顯示 `tqdm` 進度條
 - 若 `openapi.twse.com.tw` 無法連線，上市公司清單會自動 fallback 到專案內建 `listed_companies_snapshot.csv`
+- 若單一端點出現 timeout/非 JSON/HTTP 錯誤，會以 warning log 記錄並嘗試 fallback，僅在無法恢復時才停止
 
 ### 股價（日線）
 
